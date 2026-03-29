@@ -1,0 +1,105 @@
+name: Sync Upstream Repository (Advanced)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync with upstream
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM_REPO: ripienaar/free-for-dev
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const upstreamRepo = process.env.UPSTREAM_REPO;
+            
+            try {
+              // 添加上游远程仓库
+              execSync('git remote add upstream https://github.com/' + upstreamRepo + '.git', { stdio: 'inherit' });
+              
+              // 获取上游变更
+              execSync('git fetch upstream', { stdio: 'inherit' });
+              
+              // 检查是否有变更
+              const localCommit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+              const upstreamCommit = execSync('git rev-parse upstream/main', { encoding: 'utf8' }).trim();
+              
+              if (localCommit === upstreamCommit) {
+                console.log('No changes detected in upstream repository');
+                return;
+              }
+              
+              // 创建同步分支
+              const branchName = `sync/upstream-${upstreamCommit.substring(0, 7)}`;
+              execSync(`git checkout -b ${branchName}`, { stdio: 'inherit' });
+              
+              // 尝试合并
+              try {
+                execSync(`git merge upstream/main --no-commit`, { stdio: 'inherit' });
+                
+                // 保留本地 CNAME 文件
+                execSync('git checkout HEAD -- CNAME', { stdio: 'inherit' });
+                execSync('git add CNAME', { stdio: 'inherit' });
+                
+                // 提交变更
+                execSync(`git commit -m "Sync with upstream ${upstreamRepo}@${upstreamCommit}\\n\\n- Upstream commit: ${upstreamCommit}\\n- Sync date: ${new Date().toISOString()}"`, { stdio: 'inherit' });
+                
+                // 推送分支
+                execSync(`git push origin ${branchName}`, { stdio: 'inherit' });
+                
+                // 创建 PR
+                await github.rest.pulls.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Sync with upstream ${upstreamRepo}@${upstreamCommit.substring(0, 7)}`,
+                  head: branchName,
+                  base: 'main',
+                  body: `This PR syncs changes from upstream repository [${upstreamRepo}@${upstreamCommit}](https://github.com/${upstreamRepo}/commit/${upstreamCommit}).\n\n## Changes\n- Automated sync from upstream repository\n- Local CNAME file preserved\n\n## Review\nPlease review the changes and merge if everything looks correct.`,
+                  labels: ['automation', 'sync']
+                });
+                
+              } catch (mergeError) {
+                // 处理合并冲突
+                const conflictedFiles = execSync('git diff --name-only --diff-filter=U', { encoding: 'utf8' }).trim();
+                
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: 'Merge conflict detected during upstream sync',
+                  body: `## Merge Conflict Alert\n\nA merge conflict was detected while trying to sync with upstream repository ${upstreamRepo}.\n\n### Details\n- **Upstream commit**: ${upstreamCommit}\n- **Sync date**: ${new Date().toISOString()}\n- **Conflict branch**: ${branchName}\n\n### Required Action\nManual intervention is required to resolve the merge conflict. Please:\n\n1. Checkout the conflict branch: \`git checkout ${branchName}\`\n2. Resolve conflicts manually\n3. Commit and push the changes\n4. Create a pull request or merge directly\n\n### Files with conflicts\n\`\`\`\n${conflictedFiles}\n\`\`\`\n\nThis issue was automatically created by the GitHub Actions sync workflow.`,
+                  labels: ['bug', 'merge-conflict', 'needs-attention']
+                });
+              }
+              
+            } catch (error) {
+              // 处理一般错误
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Sync workflow failed',
+                body: `## Workflow Failure Alert\n\nThe upstream sync workflow has failed.\n\n### Details\n- **Failure time**: ${new Date().toISOString()}\n- **Workflow run**: [${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n### Required Action\nPlease check the workflow logs and investigate the failure.\n\n### Error Details\n\`\`\`\n${error.message}\n\`\`\``,
+                labels: ['bug', 'automation', 'needs-attention']
+              });
+              
+              throw error;
+            }

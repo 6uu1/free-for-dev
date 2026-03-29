@@ -1,0 +1,163 @@
+name: Sync Upstream Repository
+
+on:
+  schedule:
+    # 每日 UTC 02:00 执行 (北京时间 10:00)
+    - cron: '0 2 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # 获取完整历史记录
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ripienaar/free-for-dev.git
+
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+
+      - name: Check for changes
+        id: check-changes
+        run: |
+          # 检查上游是否有新提交
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/main)
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "upstream_commit=$REMOTE" >> $GITHUB_OUTPUT
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch if changes exist
+        if: steps.check-changes.outputs.changes == 'true'
+        run: |
+          git checkout -b sync/upstream-${{ steps.check-changes.outputs.upstream_commit }}
+
+      - name: Merge upstream changes
+        if: steps.check-changes.outputs.changes == 'true'
+        run: |
+          # 尝试合并上游变更
+          if ! git merge upstream/main --no-commit; then
+            echo "merge_conflict=true" >> $GITHUB_ENV
+            # 保留冲突状态，后续处理
+          else
+            echo "merge_conflict=false" >> $GITHUB_ENV
+          fi
+
+      - name: Handle CNAME file (preserve local)
+        if: steps.check-changes.outputs.changes == 'true' && env.merge_conflict == 'false'
+        run: |
+          # 确保本地 CNAME 文件不被覆盖
+          git checkout HEAD -- CNAME
+          git add CNAME
+
+      - name: Commit changes
+        if: steps.check-changes.outputs.changes == 'true' && env.merge_conflict == 'false'
+        run: |
+          git commit -m "Sync with upstream ripienaar/free-for-dev@${{ steps.check-changes.outputs.upstream_commit }}
+
+          - Upstream commit: ${{ steps.check-changes.outputs.upstream_commit }}
+          - Sync date: $(date -u)"
+
+      - name: Push changes
+        if: steps.check-changes.outputs.changes == 'true' && env.merge_conflict == 'false'
+        run: |
+          git push origin sync/upstream-${{ steps.check-changes.outputs.upstream_commit }}
+
+      - name: Create Pull Request
+        if: steps.check-changes.outputs.changes == 'true' && env.merge_conflict == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 使用 GitHub CLI 创建 PR
+          gh pr create \
+            --title "Sync with upstream ripienaar/free-for-dev@${{ steps.check-changes.outputs.upstream_commit }}" \
+            --body "This PR syncs changes from upstream repository [ripienaar/free-for-dev@${{ steps.check-changes.outputs.upstream_commit }}](https://github.com/ripienaar/free-for-dev/commit/${{ steps.check-changes.outputs.upstream_commit }}).
+
+            ## Changes
+            - Automated sync from upstream repository
+            - Local CNAME file preserved
+
+            ## Review
+            Please review the changes and merge if everything looks correct." \
+            --label "automation" \
+            --label "sync"
+
+      - name: Handle merge conflict
+        if: steps.check-changes.outputs.changes == 'true' && env.merge_conflict == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 创建 issue 通知维护者
+          gh issue create \
+            --title "Merge conflict detected during upstream sync" \
+            --body "## Merge Conflict Alert
+
+            A merge conflict was detected while trying to sync with upstream repository ripienaar/free-for-dev.
+
+            ### Details
+            - **Upstream commit**: ${{ steps.check-changes.outputs.upstream_commit }}
+            - **Sync date**: $(date -u)
+            - **Conflict branch**: sync/upstream-${{ steps.check-changes.outputs.upstream_commit }}
+
+            ### Required Action
+            Manual intervention is required to resolve the merge conflict. Please:
+
+            1. Checkout the conflict branch: \`git checkout sync/upstream-${{ steps.check-changes.outputs.upstream_commit }}\`
+            2. Resolve conflicts manually
+            3. Commit and push the changes
+            4. Create a pull request or merge directly
+
+            ### Files with conflicts
+            \`\`\`
+            $(git diff --name-only --diff-filter=U)
+            \`\`\`
+
+            This issue was automatically created by the GitHub Actions sync workflow." \
+            --label "bug" \
+            --label "merge-conflict" \
+            --label "needs-attention"
+
+      - name: Notify no changes
+        if: steps.check-changes.outputs.changes == 'false'
+        run: |
+          echo "No changes detected in upstream repository"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Sync workflow failed" \
+            --body "## Workflow Failure Alert
+
+            The upstream sync workflow has failed.
+
+            ### Details
+            - **Failure time**: $(date -u)
+            - **Workflow run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ### Required Action
+            Please check the workflow logs and investigate the failure." \
+            --label "bug" \
+            --label "automation" \
+            --label "needs-attention"
